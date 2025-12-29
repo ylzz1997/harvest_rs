@@ -1,0 +1,11 @@
+[package]
+name = "harvest_rs"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+aus = "0.1.8"
+rustfft = "6"
+realfft = "3"
+num-complex = "0.4"
+rayon = "1.11.0"
