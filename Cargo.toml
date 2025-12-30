@@ -3,9 +3,20 @@ name = "harvest_rs"
 version = "0.0.1"
 edition = "2024"
 
+[lib]
+name = "harvest_rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+# Enable Python extension module bindings (pyo3 + numpy).
+python = ["dep:pyo3", "dep:numpy"]
+
 [dependencies]
 aus = "0.1.8"
 rustfft = "6"
 realfft = "3"
 num-complex = "0.4"
 rayon = "1.11.0"
+pyo3 = { version = "0.27.2", optional = true, features = ["extension-module"] }
+numpy = { version = "0.27.1", optional = true }

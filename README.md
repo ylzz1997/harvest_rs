@@ -49,4 +49,28 @@ cargo run --release
 顺便会把 `f0.txt` 存根目录
 
 
-以上
+## Python 怎么个用法呢？
+
+### 构建/安装（推荐 maturin）
+
+在仓库根目录执行：
+
+```bash
+pip install -U maturin numpy
+maturin develop -r
+```
+
+### Python 调用示例
+
+```python
+import numpy as np
+import harvest_rs
+import librosa
+
+opt = harvest_rs.HarvestOption(f0_floor=90.0, f0_ceil=1600.0, frame_period=10.0)
+
+y, sr = librosa.load("test.mp3", sr=16000)
+print(y.shape, sr)
+t, f0 = harvest_rs.harvest(y, sr, opt)
+print(t.shape, f0.shape) 
+```
