@@ -87,14 +87,6 @@ fn nuttall_window(y_len: usize, y: &mut [f64]) {
     }
 }
 
-fn sinc(x: f64) -> f64 {
-    if x.abs() < 1e-12 {
-        1.0
-    } else {
-        (K_PI * x).sin() / (K_PI * x)
-    }
-}
-
 // WORLD(matlabfunctions.cpp) 的 decimate: IIR + filtfilt + 边界扩展(kNFact=9) + 特定抽取起点。
 fn filter_for_decimate(x: &[f64], r: usize, y: &mut [f64]) {
     debug_assert!(y.len() >= x.len());
@@ -414,13 +406,8 @@ fn get_filtered_signal(
         fft.ifft_to_real_in_place(&mut prod, &mut time);
 
         let index_bias = filter_length_half + 1;
-        // C++ world 代码中 InverseFFT 不做归一化，导致信号幅度大 N 倍。
-        // Rust 的 ifft_to_real_in_place 做了 1/N 归一化。
-        // 为了数值对齐（特别是为了让 zero_crossing_engine 里的计算与 C++ 一致），
-        // 这里把幅度乘回去。
-        let scale_back = fft_size as f64;
         for i in 0..y_length {
-            filtered_signal[i] = time[i + index_bias] * scale_back;
+            filtered_signal[i] = time[i + index_bias];
         }
     });
     // filtered_signal 已在 with_fft_ctx 内写入
@@ -450,9 +437,7 @@ fn zero_crossing_engine(
     for (i, &e) in edges.iter().enumerate() {
         let num = filtered_signal[e - 1];
         let den = filtered_signal[e] - filtered_signal[e - 1];
-        // C++ 原版这里没有加 safe guard。由于我们已经恢复了信号幅度（x fft_size），
-        // 这里的数值范围应该和 C++ 一致，去掉 safe guard 以对齐逻辑。
-        fine_edges[i] = e as f64 - num / den;
+        fine_edges[i] = e as f64 - num / (den + K_MY_SAFE_GUARD_MINIMUM);
     }
 
     let out_len = fine_edges.len() - 1;
@@ -461,8 +446,7 @@ fn zero_crossing_engine(
     interval_locations.reserve(out_len);
     intervals.reserve(out_len);
     for i in 0..out_len {
-        // C++ 原版：fs / (fine_edges[i + 1] - fine_edges[i])
-        let f = fs / (fine_edges[i + 1] - fine_edges[i]);
+        let f = fs / (fine_edges[i + 1] - fine_edges[i] + K_MY_SAFE_GUARD_MINIMUM);
         let loc = (fine_edges[i] + fine_edges[i + 1]) / 2.0 / fs;
         intervals.push(f);
         interval_locations.push(loc);
