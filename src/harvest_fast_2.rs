@@ -95,46 +95,96 @@ fn sinc(x: f64) -> f64 {
     }
 }
 
-fn decimate_fir(x: &[f64], r: usize, y: &mut [f64]) {
+// WORLD(matlabfunctions.cpp) 的 decimate: IIR + filtfilt + 边界扩展(kNFact=9) + 特定抽取起点。
+fn filter_for_decimate(x: &[f64], r: usize, y: &mut [f64]) {
+    debug_assert!(y.len() >= x.len());
+    let (a0, a1, a2, b0, b1) = match r {
+        11 => (2.450743295230728, -2.06794904601978, 0.59574774438332101, 0.0026822508007163792, 0.0080467524021491377),
+        12 => (2.4981398605924205, -2.1368928194784025, 0.62187513816221485, 0.0021097275904709001, 0.0063291827714127002),
+        10 => (2.3936475118069387, -1.9873904075111861, 0.5658879979027055, 0.0034818622251927556, 0.010445586675578267),
+        9  => (2.3236003491759578, -1.8921545617463598, 0.53148928133729068, 0.0046331164041389372, 0.013899349212416812),
+        8  => (2.2357462340187593, -1.7780899984041358, 0.49152555365968692, 0.0063522763407111993, 0.019056829022133598),
+        7  => (2.1225239019534703, -1.6395144861046302, 0.44469707800587366, 0.0090366882681608418, 0.027110064804482525),
+        6  => (1.9715352749512141, -1.4686795689225347, 0.3893908434965701, 0.013469181309343825, 0.040407543928031475),
+        5  => (1.7610939654280557, -1.2554914843859768, 0.3237186507788215, 0.021334858522387423, 0.06400457556716227),
+        4  => (1.4499664446880227, -0.98943497080950582, 0.24578252340690215, 0.036710750339322612, 0.11013225101796784),
+        3  => (0.95039378983237421, -0.67429146741526791, 0.15412211621346475, 0.071221945171178636, 0.21366583551353591),
+        2  => (0.041156734567757189, -0.42599112459189636, 0.041037215479961225, 0.16797464681802227, 0.50392394045406674),
+        _  => (0.0, 0.0, 0.0, 0.0, 0.0),
+    };
+
+    let mut w0 = 0.0_f64;
+    let mut w1 = 0.0_f64;
+    let mut w2 = 0.0_f64;
+    for (i, &v) in x.iter().enumerate() {
+        let wt = v + a0 * w0 + a1 * w1 + a2 * w2;
+        y[i] = b0 * wt + b1 * w0 + b1 * w1 + b0 * w2;
+        w2 = w1;
+        w1 = w0;
+        w0 = wt;
+    }
+}
+
+fn decimate_world(x: &[f64], r: usize, y: &mut [f64]) {
     if r <= 1 {
         let n = x.len().min(y.len());
         y[..n].copy_from_slice(&x[..n]);
         return;
     }
 
-    let y_len = (x.len() + r - 1) / r;
-    if y.is_empty() {
+    const NFACT: usize = 9;
+    if x.is_empty() || y.is_empty() {
         return;
     }
+    let x_length = x.len();
+    let ext_len = x_length + NFACT * 2;
+    let mut tmp1 = vec![0.0_f64; ext_len];
+    let mut tmp2 = vec![0.0_f64; ext_len];
 
-    let taps = 16 * r + 1;
-    let mid = (taps / 2) as isize;
-    let fc = 0.5 / (r as f64);
-
-    let mut h = vec![0.0_f64; taps];
-    for n in 0..taps {
-        let m = n as isize - mid;
-        let t = m as f64;
-        let w = 0.54 - 0.46 * (2.0 * K_PI * n as f64 / (taps as f64 - 1.0)).cos();
-        h[n] = 2.0 * fc * sinc(2.0 * fc * t) * w;
+    // 左侧扩展：tmp1[i] = 2*x[0] - x[NFACT - i]
+    for i in 0..NFACT {
+        let idx = (NFACT - i).min(x_length - 1);
+        tmp1[i] = 2.0 * x[0] - x[idx];
     }
-    let sum_h: f64 = h.iter().sum();
-    if sum_h.abs() > 1e-12 {
-        for v in &mut h {
-            *v /= sum_h;
-        }
+    // 原信号
+    tmp1[NFACT..NFACT + x_length].copy_from_slice(x);
+    // 右侧扩展：tmp1[...] = 2*x[last] - x[x_length-2 - j]
+    for j in 0..NFACT {
+        let src = if x_length >= 2 {
+            (x_length - 2).saturating_sub(j)
+        } else {
+            0
+        };
+        tmp1[NFACT + x_length + j] = 2.0 * x[x_length - 1] - x[src];
     }
 
-    for k in 0..y_len.min(y.len()) {
-        let center = (k * r) as isize;
-        let mut acc = 0.0_f64;
-        for n in 0..taps {
-            let idx = center + (n as isize - mid);
-            if idx >= 0 && (idx as usize) < x.len() {
-                acc += x[idx as usize] * h[n];
+    filter_for_decimate(&tmp1, r, &mut tmp2);
+    for i in 0..ext_len {
+        tmp1[i] = tmp2[ext_len - i - 1];
+    }
+    filter_for_decimate(&tmp1, r, &mut tmp2);
+    for i in 0..ext_len {
+        tmp1[i] = tmp2[ext_len - i - 1];
+    }
+
+    // nout = (x_length - 1)/r + 1
+    let nout = (x_length.saturating_sub(1)) / r + 1;
+    // nbeg = r - r*nout + x_length
+    let nbeg = r as isize - (r * nout) as isize + x_length as isize;
+
+    let mut count = 0usize;
+    let mut i = nbeg;
+    while count < nout && i < (x_length + NFACT) as isize {
+        if i >= 0 {
+            // WORLD: y[count++] = tmp1[i + kNFact - 1];
+            let idx = (i as usize) + NFACT - 1;
+            // idx 在 [0, ext_len) 内
+            if idx < tmp1.len() && count < y.len() {
+                y[count] = tmp1[idx];
+                count += 1;
             }
         }
-        y[k] = acc;
+        i += r as isize;
     }
 }
 
@@ -144,30 +194,37 @@ fn interp1(x: &[f64], y: &[f64], xi: &[f64], yi: &mut [f64]) {
         yi.fill(0.0);
         return;
     }
+    // WORLD(matlabfunctions.cpp) 的 interp1 行为：
+    // - 线性插值
+    // - xi 超出 x 范围时使用端点段进行线性外推（而不是置 0）
     let n = x.len();
-    let mut x_idx = 0;
+    let mut x_idx = 0usize; // 指向满足 x[x_idx] <= q 的最大 idx
 
     for (k, &q) in xi.iter().enumerate().take(yi.len()) {
-        if !q.is_finite() || q < x[0] || q > x[n - 1] {
+        if !q.is_finite() {
             yi[k] = 0.0;
             continue;
         }
 
-        // 线性推进，不需要二分查找，因为 xi 和 x 都是有序的
-        while x_idx < n - 1 && x[x_idx + 1] <= q {
+        // 线性推进（xi 与 x 单调递增时非常快）
+        while x_idx + 1 < n && x[x_idx + 1] <= q {
             x_idx += 1;
         }
 
-        let x0 = x[x_idx];
-        let x1 = x[x_idx + 1];
-        let y0 = y[x_idx];
-        let y1 = y[x_idx + 1];
+        // 选择区间 [k0, k1]，其中 k1 = k0+1，且 clamp 到 [0..n-1]
+        let k1 = if q < x[0] { 1 } else if x_idx >= n - 1 { n - 1 } else { x_idx + 1 };
+        let k0 = k1 - 1;
+
+        let x0 = x[k0];
+        let x1 = x[k1];
+        let y0 = y[k0];
+        let y1 = y[k1];
 
         if (x1 - x0).abs() < 1e-12 {
             yi[k] = y0;
         } else {
-            let t = (q - x0) / (x1 - x0);
-            yi[k] = y0 + t * (y1 - y0);
+            let s = (q - x0) / (x1 - x0);
+            yi[k] = y0 + s * (y1 - y0);
         }
     }
 }
@@ -283,7 +340,7 @@ fn get_waveform_and_spectrum_sub(
         new_x[i] = x[x_length - 1];
     }
 
-    decimate_fir(&new_x, decimation_ratio, &mut new_y);
+    decimate_world(&new_x, decimation_ratio, &mut new_y);
     let start = lag / decimation_ratio;
     for i in 0..y_length {
         y[i] = new_y[start + i];
@@ -357,8 +414,13 @@ fn get_filtered_signal(
         fft.ifft_to_real_in_place(&mut prod, &mut time);
 
         let index_bias = filter_length_half + 1;
+        // C++ world 代码中 InverseFFT 不做归一化，导致信号幅度大 N 倍。
+        // Rust 的 ifft_to_real_in_place 做了 1/N 归一化。
+        // 为了数值对齐（特别是为了让 zero_crossing_engine 里的计算与 C++ 一致），
+        // 这里把幅度乘回去。
+        let scale_back = fft_size as f64;
         for i in 0..y_length {
-            filtered_signal[i] = time[i + index_bias];
+            filtered_signal[i] = time[i + index_bias] * scale_back;
         }
     });
     // filtered_signal 已在 with_fft_ctx 内写入
@@ -388,7 +450,9 @@ fn zero_crossing_engine(
     for (i, &e) in edges.iter().enumerate() {
         let num = filtered_signal[e - 1];
         let den = filtered_signal[e] - filtered_signal[e - 1];
-        fine_edges[i] = e as f64 - num / (den + K_MY_SAFE_GUARD_MINIMUM);
+        // C++ 原版这里没有加 safe guard。由于我们已经恢复了信号幅度（x fft_size），
+        // 这里的数值范围应该和 C++ 一致，去掉 safe guard 以对齐逻辑。
+        fine_edges[i] = e as f64 - num / den;
     }
 
     let out_len = fine_edges.len() - 1;
@@ -397,7 +461,8 @@ fn zero_crossing_engine(
     interval_locations.reserve(out_len);
     intervals.reserve(out_len);
     for i in 0..out_len {
-        let f = fs / (fine_edges[i + 1] - fine_edges[i] + K_MY_SAFE_GUARD_MINIMUM);
+        // C++ 原版：fs / (fine_edges[i + 1] - fine_edges[i])
+        let f = fs / (fine_edges[i + 1] - fine_edges[i]);
         let loc = (fine_edges[i] + fine_edges[i + 1]) / 2.0 / fs;
         intervals.push(f);
         interval_locations.push(loc);
