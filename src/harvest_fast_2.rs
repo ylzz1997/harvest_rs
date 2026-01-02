@@ -296,6 +296,40 @@ thread_local! {
     static FFT_CACHE: RefCell<HashMap<usize, FftCtx>> = RefCell::new(HashMap::new());
 }
 
+#[derive(Default)]
+struct FilterScratch {
+    band_pass_filter: Vec<f64>,
+    h_spec: Vec<Complex64>,
+    prod: Vec<Complex64>,
+    time: Vec<f64>,
+}
+
+#[derive(Default)]
+struct ZeroCrossScratch {
+    edges: Vec<usize>,
+    fine_edges: Vec<f64>,
+}
+
+thread_local! {
+    // 每个 rayon worker 线程各自复用临时缓冲，减少频繁 vec! 分配
+    static FILTER_SCRATCH: RefCell<HashMap<usize, FilterScratch>> = RefCell::new(HashMap::new());
+    static ZC_SCRATCH: RefCell<ZeroCrossScratch> = RefCell::new(ZeroCrossScratch::default());
+}
+
+#[inline]
+fn with_filter_scratch<R>(fft_size: usize, f: impl FnOnce(&mut FilterScratch) -> R) -> R {
+    FILTER_SCRATCH.with(|cache| {
+        let mut map = cache.borrow_mut();
+        let scratch = map.entry(fft_size).or_insert_with(FilterScratch::default);
+        f(scratch)
+    })
+}
+
+#[inline]
+fn with_zc_scratch<R>(f: impl FnOnce(&mut ZeroCrossScratch) -> R) -> R {
+    ZC_SCRATCH.with(|s| f(&mut s.borrow_mut()))
+}
+
 #[inline]
 fn with_fft_ctx<R>(n: usize, f: impl FnOnce(&FftCtx) -> R) -> R {
     FFT_CACHE.with(|cache| {
@@ -379,35 +413,37 @@ fn get_filtered_signal(
 ) {
     debug_assert_eq!(y_spectrum.len(), fft_size / 2 + 1);
     let filter_length_half = matlab_round(fs / boundary_f0 * 2.0).max(0) as usize;
-    let mut band_pass_filter = vec![0.0_f64; fft_size];
     let win_len = filter_length_half * 2 + 1;
-    nuttall_window(win_len, &mut band_pass_filter[..win_len]);
-    for i in 0..win_len {
-        let k = i as isize - filter_length_half as isize;
-        band_pass_filter[i] *= (2.0 * K_PI * boundary_f0 * (k as f64) / fs).cos();
-    }
-    for i in win_len..fft_size {
-        band_pass_filter[i] = 0.0;
-    }
+    let index_bias = filter_length_half + 1;
 
-    with_fft_ctx(fft_size, |fft| {
-        let half = fft_size / 2 + 1;
-        debug_assert_eq!(y_spectrum.len(), half);
-
-        let mut h_spec = vec![Complex64::new(0.0, 0.0); half];
-        fft.fft_real(&band_pass_filter, &mut h_spec);
-
-        let mut prod = vec![Complex64::new(0.0, 0.0); half];
-        for i in 0..half {
-            prod[i] = y_spectrum[i] * h_spec[i];
+    // 纯复用临时缓冲，不改变任何数值路径（结果应与当前版本完全一致）
+    with_filter_scratch(fft_size, |scratch| {
+        scratch.band_pass_filter.resize(fft_size, 0.0);
+        scratch.band_pass_filter.fill(0.0);
+        nuttall_window(win_len, &mut scratch.band_pass_filter[..win_len]);
+        for i in 0..win_len {
+            let k = i as isize - filter_length_half as isize;
+            scratch.band_pass_filter[i] *= (2.0 * K_PI * boundary_f0 * (k as f64) / fs).cos();
         }
 
-        let mut time = vec![0.0_f64; fft_size];
-        fft.ifft_to_real_in_place(&mut prod, &mut time);
+        with_fft_ctx(fft_size, |fft| {
+            let half = fft_size / 2 + 1;
+            debug_assert_eq!(y_spectrum.len(), half);
 
-        let index_bias = filter_length_half + 1;
+            scratch.h_spec.resize(half, Complex64::new(0.0, 0.0));
+            fft.fft_real(&scratch.band_pass_filter, &mut scratch.h_spec);
+
+            scratch.prod.resize(half, Complex64::new(0.0, 0.0));
+            for i in 0..half {
+                scratch.prod[i] = y_spectrum[i] * scratch.h_spec[i];
+            }
+
+            scratch.time.resize(fft_size, 0.0);
+            fft.ifft_to_real_in_place(&mut scratch.prod, &mut scratch.time);
+        });
+
         for i in 0..y_length {
-            filtered_signal[i] = time[i + index_bias];
+            filtered_signal[i] = scratch.time[i + index_bias];
         }
     });
     // filtered_signal 已在 with_fft_ctx 内写入
@@ -424,34 +460,38 @@ fn zero_crossing_engine(
     interval_locations: &mut Vec<f64>,
     intervals: &mut Vec<f64>,
 ) -> usize {
-    let mut edges: Vec<usize> = Vec::new();
-    for i in 0..(y_length.saturating_sub(1)) {
-        if 0.0 < filtered_signal[i] && filtered_signal[i + 1] <= 0.0 {
-            edges.push(i + 1);
+    // 纯复用临时缓冲，不改变任何数值路径（结果应与当前版本完全一致）
+    with_zc_scratch(|scratch| {
+        scratch.edges.clear();
+        for i in 0..(y_length.saturating_sub(1)) {
+            if 0.0 < filtered_signal[i] && filtered_signal[i + 1] <= 0.0 {
+                scratch.edges.push(i + 1);
+            }
         }
-    }
-    if edges.len() < 2 {
-        return 0;
-    }
-    let mut fine_edges = vec![0.0_f64; edges.len()];
-    for (i, &e) in edges.iter().enumerate() {
-        let num = filtered_signal[e - 1];
-        let den = filtered_signal[e] - filtered_signal[e - 1];
-        fine_edges[i] = e as f64 - num / (den + K_MY_SAFE_GUARD_MINIMUM);
-    }
+        if scratch.edges.len() < 2 {
+            return 0;
+        }
 
-    let out_len = fine_edges.len() - 1;
-    interval_locations.clear();
-    intervals.clear();
-    interval_locations.reserve(out_len);
-    intervals.reserve(out_len);
-    for i in 0..out_len {
-        let f = fs / (fine_edges[i + 1] - fine_edges[i] + K_MY_SAFE_GUARD_MINIMUM);
-        let loc = (fine_edges[i] + fine_edges[i + 1]) / 2.0 / fs;
-        intervals.push(f);
-        interval_locations.push(loc);
-    }
-    out_len
+        scratch.fine_edges.resize(scratch.edges.len(), 0.0);
+        for (i, &e) in scratch.edges.iter().enumerate() {
+            let num = filtered_signal[e - 1];
+            let den = filtered_signal[e] - filtered_signal[e - 1];
+            scratch.fine_edges[i] = e as f64 - num / (den + K_MY_SAFE_GUARD_MINIMUM);
+        }
+
+        let out_len = scratch.fine_edges.len() - 1;
+        interval_locations.clear();
+        intervals.clear();
+        interval_locations.reserve(out_len);
+        intervals.reserve(out_len);
+        for i in 0..out_len {
+            let f = fs / (scratch.fine_edges[i + 1] - scratch.fine_edges[i] + K_MY_SAFE_GUARD_MINIMUM);
+            let loc = (scratch.fine_edges[i] + scratch.fine_edges[i + 1]) / 2.0 / fs;
+            intervals.push(f);
+            interval_locations.push(loc);
+        }
+        out_len
+    })
 }
 
 #[derive(Default)]
