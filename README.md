@@ -1,6 +1,6 @@
 # High-Performance Harvest F0 Estimator (Rust)
 
-**PS: 目前还不知道有什么bug，正在测试边界条件下的情况**
+**PS: 边界测试已完成，再有什么bug提issue吧，目前看最大误差在1e-27内**
 
 这是一个基于 [WORLD](https://github.com/mmorise/World) 中 Harvest 算法的高性能 Rust 移植版本
 
