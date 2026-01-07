@@ -6,9 +6,9 @@ build-backend = "maturin"
 name = "harvest_rs"
 version = "0.0.1"
 requires-python = ">=3.8"
-dependencies = ["numpy"]
+dependencies = ["numpy>=1.20"]
 
 [tool.maturin]
 features = ["python"]
-
+module-name = "harvest_rs"
 
