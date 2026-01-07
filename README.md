@@ -60,6 +60,14 @@ pip install -U maturin numpy
 maturin develop -r
 ```
 
+或者
+
+```bash
+pip install harvest_rs
+```
+
+安装发布版
+
 ### Python 调用示例
 
 ```python
